@@ -20,9 +20,7 @@ class SEBlock(nn.Module):
         https://arxiv.org/pdf/1709.01507.pdf
     """
 
-    def __init__(self,
-                 in_channels: int,
-                 rd_ratio: float = 0.0625) -> None:
+    def __init__(self, in_channels: int, rd_ratio: float = 0.0625):
         """ Construct a Squeeze and Excite Module.
 
         :param in_channels: Number of input channels.
@@ -102,6 +100,7 @@ class MobileOneBlock(nn.Module):
         self.activation = nn.ReLU()
 
         if inference_mode:
+            # bias is used in inference but not in training
             self.reparam_conv = nn.Conv2d(in_channels=in_channels,
                                           out_channels=out_channels,
                                           kernel_size=kernel_size,
@@ -112,21 +111,18 @@ class MobileOneBlock(nn.Module):
                                           bias=True)
         else:
             # Re-parameterizable skip connection
-            self.rbr_skip = nn.BatchNorm2d(num_features=in_channels) \
-                if out_channels == in_channels and stride == 1 else None
-
+            self.rbr_skip = None
+            if out_channels == in_channels and stride == 1:
+                self.rbr_skip = nn.BatchNorm2d(num_features=in_channels)
             # Re-parameterizable conv branches
-            rbr_conv = list()
-            for _ in range(self.num_conv_branches):
-                rbr_conv.append(self._conv_bn(kernel_size=kernel_size,
-                                              padding=padding))
-            self.rbr_conv = nn.ModuleList(rbr_conv)
-
+            self.rbr_conv = nn.ModuleList([
+                self._conv_bn(kernel_size=kernel_size, padding=padding)
+                for _ in range(self.num_conv_branches)
+            ])
             # Re-parameterizable scale branch
             self.rbr_scale = None
             if kernel_size > 1:
-                self.rbr_scale = self._conv_bn(kernel_size=1,
-                                               padding=0)
+                self.rbr_scale = self._conv_bn(kernel_size=1, padding=0)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """ Apply forward pass. """
@@ -135,18 +131,14 @@ class MobileOneBlock(nn.Module):
             return self.activation(self.se(self.reparam_conv(x)))
 
         # Multi-branched train-time forward pass.
-        # Skip branch output
-        identity_out = 0
+        # Skip (identity) branch output
+        out = 0
         if self.rbr_skip is not None:
-            identity_out = self.rbr_skip(x)
-
+            out += self.rbr_skip(x)
         # Scale branch output
-        scale_out = 0
         if self.rbr_scale is not None:
-            scale_out = self.rbr_scale(x)
-
+            out += self.rbr_scale(x)
         # Other branches
-        out = scale_out + identity_out
         for ix in range(self.num_conv_branches):
             out += self.rbr_conv[ix](x)
 
@@ -160,6 +152,7 @@ class MobileOneBlock(nn.Module):
         """
         if self.inference_mode:
             return
+        # recreate a Conv2D block and inject the kernel & bias weights
         kernel, bias = self._get_kernel_bias()
         self.reparam_conv = nn.Conv2d(in_channels=self.rbr_conv[0].conv.in_channels,
                                       out_channels=self.rbr_conv[0].conv.out_channels,
@@ -189,24 +182,20 @@ class MobileOneBlock(nn.Module):
         :return: Tuple of (kernel, bias) after fusing branches.
         """
         # get weights and bias of scale branch
-        kernel_scale = 0
-        bias_scale = 0
+        kernel_scale = bias_scale = 0
         if self.rbr_scale is not None:
             kernel_scale, bias_scale = self._fuse_bn_tensor(self.rbr_scale)
             # Pad scale branch kernel to match conv branch kernel size.
             pad = self.kernel_size // 2
-            kernel_scale = torch.nn.functional.pad(kernel_scale,
-                                                   [pad, pad, pad, pad])
+            kernel_scale = torch.nn.functional.pad(kernel_scale, [pad, pad, pad, pad])
 
         # get weights and bias of skip branch
-        kernel_identity = 0
-        bias_identity = 0
+        kernel_identity = bias_identity = 0
         if self.rbr_skip is not None:
             kernel_identity, bias_identity = self._fuse_bn_tensor(self.rbr_skip)
 
         # get weights and bias of conv branches
-        kernel_conv = 0
-        bias_conv = 0
+        kernel_conv = bias_conv = 0
         for ix in range(self.num_conv_branches):
             _kernel, _bias = self._fuse_bn_tensor(self.rbr_conv[ix])
             kernel_conv += _kernel
@@ -233,6 +222,7 @@ class MobileOneBlock(nn.Module):
         else:
             assert isinstance(branch, nn.BatchNorm2d)
             if not hasattr(self, 'id_tensor'):
+                # single value 1 at the center of a kernel
                 input_dim = self.in_channels // self.groups
                 kernel_value = torch.zeros((self.in_channels,
                                             input_dim,
@@ -240,10 +230,7 @@ class MobileOneBlock(nn.Module):
                                             self.kernel_size),
                                            dtype=branch.weight.dtype,
                                            device=branch.weight.device)
-                for i in range(self.in_channels):
-                    kernel_value[i, i % input_dim,
-                                 self.kernel_size // 2,
-                                 self.kernel_size // 2] = 1
+                kernel_value[:, :, self.kernel_size // 2, self.kernel_size // 2] = 1
                 self.id_tensor = kernel_value
             kernel = self.id_tensor
             running_mean = branch.running_mean
@@ -264,6 +251,7 @@ class MobileOneBlock(nn.Module):
         :param padding: Zero-padding size.
         :return: Conv-BN module.
         """
+        # use in training only, no bias in Conv2d because the BN layer will provide bias
         mod_list = nn.Sequential()
         mod_list.add_module('conv', nn.Conv2d(in_channels=self.in_channels,
                                               out_channels=self.out_channels,
